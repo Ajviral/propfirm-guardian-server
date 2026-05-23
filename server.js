@@ -219,6 +219,23 @@ app.post('/api/account-update', (req, res) => {
   });
 });
 
+app.post('/', (req, res) => {
+  // Fallback route - handles EA posts that miss the /api/account-update path
+  const { token, accountNumber, accountName, accountServer,
+          accountCurrency, leverage, balance, equity, margin,
+          freeMargin, floatingPnL, marginLevel, positions, timestamp } = req.body;
+  if (!token || !accountNumber) {
+    return res.status(400).json({ success: false, error: 'Missing token or accountNumber' });
+  }
+  const accountData = { token, accountNumber, accountName, accountServer,
+    accountCurrency, leverage, balance, equity, margin, freeMargin,
+    floatingPnL, marginLevel, positions, timestamp, receivedAt: Date.now() };
+  accountDataStore.set(token, accountData);
+  broadcastToSubscribers(token, accountData);
+  console.log('Root route - Data received for token:', token, 'Balance:', balance, 'Equity:', equity);
+  return res.status(200).json({ success: true, message: 'Data received' });
+});
+
 /**
  * GET /api/account/:token
  * Returns the latest stored snapshot — REST fallback when WebSocket is unavailable.
