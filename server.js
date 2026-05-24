@@ -49,6 +49,7 @@ app.use(cors());
 
 // Parse JSON bodies for POST /api/account-update.
 app.use(express.json());
+app.use(express.text({ type: '*/*' }));
 
 // Shared HTTP server — Express and WebSocket listen on the same port.
 const server = http.createServer(app);
@@ -59,6 +60,22 @@ const wss = new WebSocketServer({ server });
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/**
+ * Normalize request body from Express — handles JSON objects, raw strings from
+ * MQL5 WebRequest (which may not send Content-Type: application/json), etc.
+ *
+ * @param {unknown} body - req.body as received by Express
+ * @returns {object} Parsed payload object, or {} if unparseable
+ */
+function parseBody(body) {
+  if (!body) return {};
+  if (typeof body === 'object') return body;
+  if (typeof body === 'string') {
+    try { return JSON.parse(body); } catch { return {}; }
+  }
+  return {};
+}
 
 /**
  * Broadcast an account update to every WebSocket client subscribed to a token.
@@ -159,6 +176,9 @@ function unsubscribeClient(ws) {
  * Primary ingestion endpoint called by PropFirmGuardianEA.mq5.
  */
 app.post('/api/account-update', (req, res) => {
+  console.log('Raw body type:', typeof req.body, 'Body:', JSON.stringify(req.body).substring(0, 200));
+
+  const parsed = parseBody(req.body);
   const {
     token,
     accountNumber,
@@ -174,7 +194,7 @@ app.post('/api/account-update', (req, res) => {
     marginLevel,
     positions,
     timestamp,
-  } = req.body;
+  } = parsed;
 
   // token and accountNumber are mandatory — reject with 400 if missing or empty.
   if (!token || !accountNumber) {
@@ -221,9 +241,12 @@ app.post('/api/account-update', (req, res) => {
 
 app.post('/', (req, res) => {
   // Fallback route - handles EA posts that miss the /api/account-update path
+  console.log('Raw body type:', typeof req.body, 'Body:', JSON.stringify(req.body).substring(0, 200));
+
+  const parsed = parseBody(req.body);
   const { token, accountNumber, accountName, accountServer,
           accountCurrency, leverage, balance, equity, margin,
-          freeMargin, floatingPnL, marginLevel, positions, timestamp } = req.body;
+          freeMargin, floatingPnL, marginLevel, positions, timestamp } = parsed;
   if (!token || !accountNumber) {
     return res.status(400).json({ success: false, error: 'Missing token or accountNumber' });
   }
