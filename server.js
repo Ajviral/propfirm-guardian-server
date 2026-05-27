@@ -20,6 +20,19 @@ const cors = require('cors');
 /** Port — Railway and most PaaS hosts inject PORT automatically. */
 const PORT = process.env.PORT || 3000;
 
+/** RevenueCat secret API key — server-side only (never ship to mobile clients). */
+const REVENUECAT_SECRET_KEY =
+  process.env.REVENUECAT_SECRET_KEY || 'sk_TPVDZMTpneIpLKDNiNOgryKSLPZSu';
+
+/**
+ * RevenueCat project ID for V2 REST API.
+ * Set REVENUECAT_PROJECT_ID on Railway when available; falls back to V1 subscribers API.
+ */
+const REVENUECAT_PROJECT_ID = process.env.REVENUECAT_PROJECT_ID || '';
+
+const PRO_ENTITLEMENT_ID = 'pro';
+const SUBSCRIPTION_CACHE_TTL_MS = 5 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // In-memory storage
 // ---------------------------------------------------------------------------
@@ -37,6 +50,18 @@ const accountDataStore = new Map();
  * @type {Map<string, Set<WebSocket>>}
  */
 const subscribedClients = new Map();
+
+/**
+ * Maps MT5 connection token → RevenueCat app user id (from mobile register-token).
+ * @type {Map<string, { revenueCatUserId: string; platform: string; registeredAt: number }>}
+ */
+const tokenUserMap = new Map();
+
+/**
+ * Cached subscription validation results per RevenueCat user id.
+ * @type {Map<string, { active: boolean; at: number }>}
+ */
+const subscriptionCache = new Map();
 
 // ---------------------------------------------------------------------------
 // Express + HTTP server setup
@@ -167,18 +192,114 @@ function unsubscribeClient(ws) {
   ws.subscribedTokens.clear();
 }
 
-// ---------------------------------------------------------------------------
-// HTTP routes
-// ---------------------------------------------------------------------------
+/**
+ * Returns true when a RevenueCat entitlement is active (lifetime or not expired).
+ * @param {object | undefined} entitlement
+ */
+function isEntitlementActive(entitlement) {
+  if (!entitlement) return false;
+  if (entitlement.expires_date == null) return true;
+  return new Date(entitlement.expires_date) > new Date();
+}
 
 /**
- * POST /api/account-update
- * Primary ingestion endpoint called by PropFirmGuardianEA.mq5.
+ * Validates `pro` entitlement via RevenueCat REST API (5-minute cache per user).
+ * Uses V2 when REVENUECAT_PROJECT_ID is set; otherwise V1 subscribers endpoint.
+ *
+ * @param {string} revenueCatUserId
+ * @returns {Promise<boolean>}
  */
-app.post('/api/account-update', (req, res) => {
-  console.log('Raw body type:', typeof req.body, 'Body:', JSON.stringify(req.body).substring(0, 200));
+async function validateSubscription(revenueCatUserId) {
+  const cached = subscriptionCache.get(revenueCatUserId);
+  if (cached && Date.now() - cached.at < SUBSCRIPTION_CACHE_TTL_MS) {
+    return cached.active;
+  }
 
-  const parsed = parseBody(req.body);
+  let active = false;
+
+  try {
+    let url;
+    if (REVENUECAT_PROJECT_ID) {
+      url = `https://api.revenuecat.com/v2/projects/${REVENUECAT_PROJECT_ID}/customers/${encodeURIComponent(revenueCatUserId)}`;
+    } else {
+      url = `https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(revenueCatUserId)}`;
+    }
+
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${REVENUECAT_SECRET_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      console.error('[RevenueCat] API error:', res.status, revenueCatUserId);
+      subscriptionCache.set(revenueCatUserId, { active: false, at: Date.now() });
+      return false;
+    }
+
+    const data = await res.json();
+
+    if (REVENUECAT_PROJECT_ID) {
+      const items = data.active_entitlements?.items ?? data.items ?? [];
+      active = items.some(
+        (item) =>
+          item.entitlement_id === PRO_ENTITLEMENT_ID ||
+          item.entitlement_identifier === PRO_ENTITLEMENT_ID ||
+          item.lookup_key === PRO_ENTITLEMENT_ID,
+      );
+      const entitlements = data.entitlements?.items ?? [];
+      if (!active) {
+        active = entitlements.some(
+          (item) =>
+            (item.entitlement_id === PRO_ENTITLEMENT_ID ||
+              item.lookup_key === PRO_ENTITLEMENT_ID) &&
+            (item.is_active === true || item.expires_at == null),
+        );
+      }
+    } else {
+      active = isEntitlementActive(data.subscriber?.entitlements?.[PRO_ENTITLEMENT_ID]);
+    }
+  } catch (err) {
+    console.error('[RevenueCat] validateSubscription failed:', err.message);
+    active = false;
+  }
+
+  subscriptionCache.set(revenueCatUserId, { active, at: Date.now() });
+  return active;
+}
+
+/**
+ * Enforces subscription for registered tokens. Unregistered tokens are allowed
+ * (dev/testing) with a warning log.
+ *
+ * @param {string} token
+ * @returns {Promise<{ ok: true } | { ok: false; status: number; body: object }>}
+ */
+async function enforceTokenSubscription(token) {
+  const mapping = tokenUserMap.get(token);
+
+  if (!mapping?.revenueCatUserId) {
+    console.warn(`Warning: unregistered token ${token}`);
+    return { ok: true };
+  }
+
+  const active = await validateSubscription(mapping.revenueCatUserId);
+  if (!active) {
+    return {
+      ok: false,
+      status: 403,
+      body: { success: false, error: 'Subscription inactive' },
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Shared handler for MT5 account push payloads (both POST routes).
+ */
+async function handleAccountPush(parsed, res, logPrefix) {
   const {
     token,
     accountNumber,
@@ -196,7 +317,6 @@ app.post('/api/account-update', (req, res) => {
     timestamp,
   } = parsed;
 
-  // token and accountNumber are mandatory — reject with 400 if missing or empty.
   if (!token || !accountNumber) {
     return res.status(400).json({
       success: false,
@@ -204,7 +324,11 @@ app.post('/api/account-update', (req, res) => {
     });
   }
 
-  // Build the stored record with all known fields plus server-side receive time.
+  const subscriptionCheck = await enforceTokenSubscription(token);
+  if (!subscriptionCheck.ok) {
+    return res.status(subscriptionCheck.status).json(subscriptionCheck.body);
+  }
+
   const data = {
     token,
     accountNumber,
@@ -223,40 +347,63 @@ app.post('/api/account-update', (req, res) => {
     receivedAt: Date.now(),
   };
 
-  // Upsert: always keep only the most recent snapshot per token.
   accountDataStore.set(token, data);
-
-  // Push live update to all mobile clients watching this token.
   broadcastToSubscribers(token, data);
 
   console.log(
-    `Data received for token: ${token} Balance: ${balance} Equity: ${equity}`,
+    `${logPrefix} token: ${token} Balance: ${balance} Equity: ${equity}`,
   );
 
   return res.status(200).json({
     success: true,
     message: 'Data received',
   });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP routes
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/register-token
+ * Links an MT5 connection token to a RevenueCat customer id from the mobile app.
+ */
+app.post('/api/register-token', (req, res) => {
+  const parsed = parseBody(req.body);
+  const { token, revenueCatUserId, platform } = parsed;
+
+  if (!token || !revenueCatUserId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing token or revenueCatUserId',
+    });
+  }
+
+  tokenUserMap.set(token, {
+    revenueCatUserId,
+    platform: platform ?? 'unknown',
+    registeredAt: Date.now(),
+  });
+
+  console.log(`[Register] token ${token} → RevenueCat user ${revenueCatUserId}`);
+
+  return res.status(200).json({ success: true });
 });
 
-app.post('/', (req, res) => {
-  // Fallback route - handles EA posts that miss the /api/account-update path
+/**
+ * POST /api/account-update
+ * Primary ingestion endpoint called by PropFirmGuardianEA.mq5.
+ */
+app.post('/api/account-update', async (req, res) => {
   console.log('Raw body type:', typeof req.body, 'Body:', JSON.stringify(req.body).substring(0, 200));
-
   const parsed = parseBody(req.body);
-  const { token, accountNumber, accountName, accountServer,
-          accountCurrency, leverage, balance, equity, margin,
-          freeMargin, floatingPnL, marginLevel, positions, timestamp } = parsed;
-  if (!token || !accountNumber) {
-    return res.status(400).json({ success: false, error: 'Missing token or accountNumber' });
-  }
-  const accountData = { token, accountNumber, accountName, accountServer,
-    accountCurrency, leverage, balance, equity, margin, freeMargin,
-    floatingPnL, marginLevel, positions, timestamp, receivedAt: Date.now() };
-  accountDataStore.set(token, accountData);
-  broadcastToSubscribers(token, accountData);
-  console.log('Root route - Data received for token:', token, 'Balance:', balance, 'Equity:', equity);
-  return res.status(200).json({ success: true, message: 'Data received' });
+  return handleAccountPush(parsed, res, 'Data received for');
+});
+
+app.post('/', async (req, res) => {
+  console.log('Raw body type:', typeof req.body, 'Body:', JSON.stringify(req.body).substring(0, 200));
+  const parsed = parseBody(req.body);
+  return handleAccountPush(parsed, res, 'Root route - Data received for');
 });
 
 /**
